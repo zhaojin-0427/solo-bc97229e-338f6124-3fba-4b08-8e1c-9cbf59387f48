@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>风机故障模型 · 训练数据工程</title>
+  <style>
+    :root { --bg:#0f172a; --card:#1e293b; --line:#334155; --txt:#e2e8f0;
+            --muted:#94a3b8; --accent:#38bdf8; --ok:#22c55e; --err:#f87171;
+            --warn:#fbbf24; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: -apple-system, "Segoe UI", "PingFang SC",
+           "Microsoft YaHei", sans-serif; background:var(--bg); color:var(--txt); }
+    header { padding:20px 28px; border-bottom:1px solid var(--line); }
+    header h1 { margin:0 0 4px; font-size:20px; }
+    header p { margin:0; color:var(--muted); font-size:13px; }
+    main { padding:24px 28px; max-width:1180px; margin:0 auto;
+           display:grid; gap:20px; grid-template-columns:1fr 1fr; }
+    .card { background:var(--card); border:1px solid var(--line);
+            border-radius:12px; padding:18px 20px; }
+    .card.full { grid-column:1 / -1; }
+    h2 { font-size:15px; margin:0 0 14px; color:var(--accent); }
+    label { display:block; font-size:13px; color:var(--muted); margin-bottom:6px; }
+    input[type=file] { width:100%; font-size:13px; margin-bottom:12px;
+            color:var(--txt); }
+    button { background:var(--accent); color:#082f49; border:0; border-radius:8px;
+            padding:9px 18px; font-weight:600; cursor:pointer; font-size:13px; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    button.ghost { background:transparent; color:var(--accent);
+            border:1px solid var(--accent); padding:5px 12px; }
+    table { width:100%; border-collapse:collapse; font-size:12.5px; }
+    th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line);
+            vertical-align:top; }
+    th { color:var(--muted); font-weight:500; }
+    .tag { display:inline-block; padding:2px 8px; border-radius:999px;
+            font-size:11px; font-weight:600; }
+    .tag.accepted, .tag.completed { background:rgba(34,197,94,.15); color:var(--ok); }
+    .tag.rejected, .tag.failed { background:rgba(248,113,113,.15); color:var(--err); }
+    .tag.queued { background:rgba(251,191,36,.15); color:var(--warn); }
+    .tag.running { background:rgba(56,189,248,.15); color:var(--accent); }
+    .bar { width:140px; height:8px; background:#0f172a; border-radius:999px;
+            overflow:hidden; display:inline-block; vertical-align:middle; }
+    .bar > i { display:block; height:100%; background:var(--accent); }
+    .msg { font-size:12.5px; margin-top:10px; padding:8px 10px; border-radius:8px;
+            display:none; white-space:pre-wrap; }
+    .msg.show { display:block; }
+    .msg.ok { background:rgba(34,197,94,.12); color:var(--ok); }
+    .msg.err { background:rgba(248,113,113,.12); color:var(--err); }
+    .reason { color:var(--err); font-size:12px; max-width:320px; }
+    .muted { color:var(--muted); }
+    code { background:#0f172a; padding:1px 6px; border-radius:4px; font-size:11px; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>风机故障模型 · 训练数据工程控制台</h1>
+  <p>按预测时刻可获得的温度生成训练表 · 仅使用测量/可用时刻均不晚于预测时刻的读数 · 任务输入受理即固定，补传不影响在途任务</p>
+</header>
+<main>
+  <section class="card">
+    <h2>① 导入监测归档 CSV</h2>
+    <label>列：机组 / 测量时刻 / 可用时刻 / 温度（同键异值整批拒绝）</label>
+    <input type="file" id="archiveFile" accept=".csv,text/csv">
+    <button onclick="uploadArchive()">导入归档</button>
+    <div id="archiveMsg" class="msg"></div>
+  </section>
+
+  <section class="card">
+    <h2>② 上传运维样本 CSV 发起任务</h2>
+    <label>列：样本号 / 机组 / 预测时刻 / 故障标签（样本号唯一，时刻为 UTC 整秒）</label>
+    <input type="file" id="sampleFile" accept=".csv,text/csv">
+    <button onclick="uploadSamples()">受理并后台执行</button>
+    <div id="jobMsg" class="msg"></div>
+  </section>
+
+  <section class="card full">
+    <h2>归档导入记录</h2>
+    <table>
+      <thead><tr><th>#</th><th>文件</th><th>状态</th><th>行数</th>
+        <th>新插入 / 复用</th><th>拒绝原因</th><th>时间(UTC)</th></tr></thead>
+      <tbody id="importsBody"></tbody>
+    </table>
+  </section>
+
+  <section class="card full">
+    <h2>关联任务与下载（每 2 秒自动刷新）</h2>
+    <table>
+      <thead><tr><th>任务ID</th><th>文件</th><th>状态</th><th>进度</th>
+        <th>错误</th><th>创建时间(UTC)</th><th>输出</th></tr></thead>
+      <tbody id="jobsBody"></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+function showMsg(elId, text, ok) {
+  const el = document.getElementById(elId);
+  el.textContent = text;
+  el.className = 'msg show ' + (ok ? 'ok' : 'err');
+}
+async function uploadArchive() {
+  const f = document.getElementById('archiveFile').files[0];
+  if (!f) return showMsg('archiveMsg', '请先选择文件', false);
+  const fd = new FormData(); fd.append('file', f);
+  const r = await fetch('/api/imports', { method: 'POST', body: fd });
+  const d = await r.json();
+  if (r.ok) showMsg('archiveMsg',
+    `已受理：共 ${d.rows_total} 行，新插入 ${d.rows_inserted} 行，复用 ${d.rows_reused} 行`, true);
+  else showMsg('archiveMsg', '整批拒绝：' + (d.error || r.statusText), false);
+  loadImports();
+}
+async function uploadSamples() {
+  const f = document.getElementById('sampleFile').files[0];
+  if (!f) return showMsg('jobMsg', '请先选择文件', false);
+  const fd = new FormData(); fd.append('file', f);
+  const r = await fetch('/api/jobs', { method: 'POST', body: fd });
+  const d = await r.json();
+  if (r.ok) showMsg('jobMsg', '任务已受理：' + d.job_id, true);
+  else showMsg('jobMsg', '受理失败：' + (d.error || r.statusText), false);
+  loadJobs();
+}
+async function loadImports() {
+  const rows = await (await fetch('/api/imports')).json();
+  document.getElementById('importsBody').innerHTML = rows.map(r => `
+    <tr><td>${r.id}</td><td>${escapeHtml(r.filename)}</td>
+      <td><span class="tag ${r.status}">${r.status === 'accepted' ? '已接受' : '已拒绝'}</span></td>
+      <td>${r.rows_total}</td>
+      <td>${r.rows_inserted} / ${r.rows_total - r.rows_inserted}</td>
+      <td class="reason">${escapeHtml(r.reason || '')}</td>
+      <td class="muted">${r.created_at}</td></tr>`).join('')
+    || '<tr><td colspan="7" class="muted">暂无记录</td></tr>';
+}
+async function loadJobs() {
+  const rows = await (await fetch('/api/jobs')).json();
+  const statusText = {queued:'排队中', running:'执行中', completed:'已完成', failed:'失败'};
+  document.getElementById('jobsBody').innerHTML = rows.map(j => `
+    <tr><td><code>${j.id.slice(0,12)}</code></td>
+      <td>${escapeHtml(j.filename)}</td>
+      <td><span class="tag ${j.status}">${statusText[j.status] || j.status}</span></td>
+      <td><span class="bar"><i style="width:${(j.progress*100).toFixed(1)}%"></i></span>
+          ${j.processed_rows}/${j.total_rows}</td>
+      <td class="reason">${escapeHtml(j.error || '')}</td>
+      <td class="muted">${j.created_at}</td>
+      <td>${j.downloadable
+        ? `<a href="/api/jobs/${j.id}/download"><button class="ghost">下载 CSV</button></a>`
+        : '<span class="muted">未完成不可下载</span>'}</td></tr>`).join('')
+    || '<tr><td colspan="7" class="muted">暂无任务</td></tr>';
+}
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+loadImports(); loadJobs();
+setInterval(loadJobs, 2000);
+setInterval(loadImports, 5000);
+</script>
+</body>
+</html>

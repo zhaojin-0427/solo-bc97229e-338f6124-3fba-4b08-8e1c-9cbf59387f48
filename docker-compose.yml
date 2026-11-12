@@ -1,0 +1,22 @@
+services:
+  web:
+    build: .
+    image: turbine-training-pipeline:latest
+    container_name: turbine-training-pipeline
+    ports:
+      - "8000:8000"
+    environment:
+      APP_DATA_DIR: /data
+      APP_DB_PATH: /data/app.db
+    volumes:
+      # 持久化 SQLite 数据库、固定的任务输入与输出文件，重启后任务可续跑
+      - turbine-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-I", "/app/app/healthcheck.py"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  turbine-data:
